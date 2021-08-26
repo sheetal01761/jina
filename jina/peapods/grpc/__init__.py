@@ -1,9 +1,12 @@
 import argparse
 import asyncio
-from typing import Optional, Callable
+from threading import Thread
+from typing import Optional, Callable, List, Dict, Union
 
 import grpc
 from google.protobuf import struct_pb2
+from kubernetes import watch
+from kubernetes.client import CoreV1Api
 
 from jina.logging.logger import JinaLogger
 from jina.proto import jina_pb2_grpc, jina_pb2
@@ -25,11 +28,15 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
         args: argparse.Namespace,
         message_callback: Callable[['Message'], None],
         logger: Optional['JinaLogger'] = None,
+        connection_pool: 'GrpcK8sConnectionPool' = None,
     ):
         self.args = args
-        self._stubs = {}
         self._logger = logger or JinaLogger(self.__class__.__name__)
         self.callback = message_callback
+        if connection_pool:
+            self._connection_pool = connection_pool
+        else:
+            self._connection_pool = GrpcK8sConnectionPool()
         self.msg_recv = 0
         self.msg_sent = 0
         self._pending_tasks = []
@@ -63,19 +70,13 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
                 )
 
     def _send_message(self, msg, pod_address):
-        if pod_address not in self._stubs:
-            self._stubs[pod_address] = Grpclet._create_grpc_stub(pod_address)
         try:
             self.msg_sent += 1
 
-            # this wraps the awaitable object from grpc as a coroutine so it can be used as a task
-            # the grpc call function is not a coroutine but some _AioCall
-            async def task_wrapper(new_message, pod_address):
-                await self._stubs[pod_address].Call(new_message)
-
             self._pending_tasks.append(
-                asyncio.create_task(task_wrapper(msg, pod_address))
+                self._connection_pool.send_message(msg, pod_address)
             )
+
             self._update_pending_tasks()
         except grpc.RpcError as ex:
             self._logger.error('Sending data request via grpc failed', ex)
@@ -135,6 +136,7 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
         :param kwargs: Extra key-value arguments
         """
         self._update_pending_tasks()
+        self._connection_pool.close()
         try:
             await asyncio.wait_for(asyncio.gather(*self._pending_tasks), timeout=1.0)
         except asyncio.TimeoutError:
@@ -182,3 +184,233 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
         self.msg_recv += 1
         self._update_pending_tasks()
         return struct_pb2.Value()
+
+
+class ConnectionPool:
+    """
+    Maintains a list of connections and uses round roubin for selecting a connection
+
+    :param port: port to use for the connections
+    """
+
+    def __init__(self, port: int):
+        self.port = port
+        self._connections = []
+        self._ip_to_stub_idx = {}
+        self._rr_counter = 0
+
+    def add_connection(self, ip: str, connection):
+        """
+        Add connection with ip to the connection pool
+        :param ip: Target IP of this connection
+        :param connection: The connection to add
+        """
+        if ip not in self._ip_to_stub_idx:
+            self._ip_to_stub_idx[ip] = len(self._connections)
+            self._connections.append(connection)
+
+    def remove_connection(self, ip: str):
+        """
+        Remove connection with ip from the connection pool
+        :param ip: Remove connection for this ip
+        :returns: The removed connection or None if there was not any for the given ip
+        """
+        if ip in self._ip_to_stub_idx:
+            return self._connections.pop(self._ip_to_stub_idx.pop(ip))
+
+        return None
+
+    def get_connection(self):
+        """
+        Returns a connection from the pool. Strategy is round robin
+        :returns: A connection from the pool
+        """
+        stub = self._connections[self._rr_counter]
+        self._rr_counter = (self._rr_counter + 1) % len(self._connections)
+        return stub
+
+    def has_connection(self, ip: str) -> bool:
+        """
+        Checks if a connection for ip exists in the pool
+        :param ip: The ip to check
+        :returns: True if a connection for the ip exists in the pool
+        """
+        return ip in self._ip_to_stub_idx
+
+
+class K8sConnectionPool:
+    """
+    Manages connections to replicas in a K8s deployment.
+
+    :param namespace: K8s namespace the deployments redide in
+    :param deployments: deployments to manage connections for, needs to have (deployment) name and head_host, head_port_in
+    :param client: K8s client
+    """
+
+    def __init__(
+        self,
+        namespace: str = None,
+        deployments: List[Dict[str, Union[str, int]]] = None,
+        client: CoreV1Api = None,
+        enabled=False,
+        logger: JinaLogger = None,
+    ):
+        if enabled and not client:
+            raise ValueError('K8sConnectionPool enabled, but no client was provided')
+
+        self._namespace = namespace
+        self._deployment_hostaddresses = {}
+        self._connections = {}
+        self._ip_port = {}
+        self._k8s_client = client
+        self.enabled = enabled
+        self._logger = logger or JinaLogger(self.__class__.__name__)
+
+        if deployments:
+            self.deployments = deployments
+        else:
+            self.deployments = {}
+        for deployment in self.deployments:
+            self._deployment_hostaddresses[deployment['name']] = deployment['head_host']
+            self._connections[deployment['head_host']] = ConnectionPool(
+                deployment['head_port_in']
+            )
+
+        self._fetch_initial_state()
+
+        self.update_thread = Thread(target=self.run)
+        self.update_thread.start()
+
+    def _fetch_initial_state(self):
+        if self.enabled:
+            namespaced_pods = self._k8s_client.list_namespaced_pod(self._namespace)
+            for item in namespaced_pods.items:
+                self._process_item(item)
+        else:
+            for target in self._connections:
+                connection_pool = self._connections[target]
+                connection_pool.add_connection(
+                    target,
+                    self._create_connection(target=f'{target}:{connection_pool.port}'),
+                )
+
+    def run(self):
+        """
+        Subscribes on MODIFIED events from list_namespaced_pod AK8s PI
+        """
+        while self.enabled:
+            w = watch.Watch()
+            for event in w.stream(
+                self._k8s_client.list_namespaced_pod, self._namespace
+            ):
+                if event['type'] == 'MODIFIED':
+                    self._process_item(event['object'])
+
+    def send_message(self, msg: Message, deployment_address: str):
+        """Send msg to deployment_address via one of the pooled connections
+
+        :param msg: message to send
+        :param deployment_address: address to send to, should include the port like 1.1.1.1:53
+        :return: result of the actual send method
+        """
+        host = deployment_address[: deployment_address.rfind(':')]
+        if host in self._connections:
+            pooled_connection = self._connections[host].get_connection()
+            return self._send_message(msg, pooled_connection)
+        elif not self.enabled:
+            # If the pool is disabled and an unknown connection is requested: create it
+            connection_pool = self._create_connection_pool(deployment_address, host)
+            return self._send_message(msg, connection_pool.get_connection())
+        else:
+            raise ValueError(f'Unknown address {deployment_address}')
+
+    def _create_connection_pool(self, deployment_address, host):
+        port = deployment_address[deployment_address.rfind(':') + 1 :]
+        connection_pool = ConnectionPool(port=port)
+        connection_pool.add_connection(
+            host, self._create_connection(target=deployment_address)
+        )
+        self._connections[host] = connection_pool
+        return connection_pool
+
+    def close(self):
+        """
+        Closes the connection pool
+        """
+        self._connections.clear()
+        self.enabled = False
+
+    def _send_message(self, msg: Message, connection):
+        raise NotImplementedError
+
+    def _create_connection(self, target):
+        raise NotImplementedError
+
+    @staticmethod
+    def _pod_is_up(item):
+        return item.status.pod_ip is not None and item.status.phase == 'Running'
+
+    def _process_item(self, item):
+        deployment_name = item.metadata.labels["app"]
+        is_deleted = item.metadata.deletion_timestamp is not None
+
+        if not is_deleted and K8sConnectionPool._pod_is_up(item):
+            if deployment_name in self._deployment_hostaddresses:
+                target = item.status.pod_ip
+                if not self._connections[
+                    self._deployment_hostaddresses[deployment_name]
+                ].has_connection(target):
+                    self._logger.debug(
+                        f'Adding connection to {target} for deployment {deployment_name} at {self._deployment_hostaddresses[deployment_name]}'
+                    )
+
+                    connection_pool = self._connections[
+                        self._deployment_hostaddresses[deployment_name]
+                    ]
+                    connection_pool.add_connection(
+                        target,
+                        self._create_connection(
+                            target=f'{target}:{connection_pool.port}'
+                        ),
+                    )
+            else:
+                self._logger.debug(
+                    f'Observed state change in unknown deployment {deployment_name}'
+                )
+        elif is_deleted and K8sConnectionPool._pod_is_up(item):
+            target = item.status.pod_ip
+            if self._connections[
+                self._deployment_hostaddresses[deployment_name]
+            ].has_connection(target):
+                self._logger.debug(
+                    f'Removing connection to {target} for deployment {deployment_name} at {self._deployment_hostaddresses[deployment_name]}'
+                )
+                self._connections[
+                    self._deployment_hostaddresses[deployment_name]
+                ].remove_connection(target)
+
+
+class GrpcK8sConnectionPool(K8sConnectionPool):
+    """
+    K8sConnectionPool which uses gRPC as the communication mechanism
+    """
+
+    def _send_message(self, msg: Message, connection):
+        # this wraps the awaitable object from grpc as a coroutine so it can be used as a task
+        # the grpc call function is not a coroutine but some _AioCall
+        async def task_wrapper(new_message, stub):
+            await stub.Call(new_message)
+
+        return asyncio.create_task(task_wrapper(msg, connection))
+
+    def _create_connection(self, target):
+        self._logger.debug(f'create connection to {target}')
+        channel = grpc.aio.insecure_channel(
+            target,
+            options=[
+                ('grpc.max_send_message_length', -1),
+                ('grpc.max_receive_message_length', -1),
+            ],
+        )
+
+        return jina_pb2_grpc.JinaDataRequestRPCStub(channel)
